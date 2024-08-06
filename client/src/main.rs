@@ -1,75 +1,44 @@
+mod cli;
 mod ecash;
 mod escrow_client;
+mod nostr;
 
 use std::env;
 
 use anyhow::anyhow;
 use cashu_escrow_common as common;
-use common::cli::get_user_input;
-use common::nostr::NostrClient;
-use common::TradeContract;
+use cdk::nuts::PublicKey as EcashPubkey;
+use cli::{ClientCliInput, TradeMode};
+use common::{cli::get_user_input, nostr::NostrClient, TradeContract};
 use dotenv::dotenv;
-use ecash::EcashWallet;
-use escrow_client::{EscrowUser, Trader};
+use ecash::ClientEcashWallet;
+use escrow_client::*;
+use log::{debug, info};
+use nostr::ClientNostrInstance;
 use nostr_sdk::prelude::*;
+use nostr_sdk::PublicKey as NostrPubkey;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
-    // parsing was hacked together last minute :)
-    // information would be communicated oob
-    let mut buyer_npub: String = env::var("BUYER_NPUB")?;
-    let mut seller_npub: String = env::var("SELLER_NPUB")?;
-    let coordinator_npub: String = env::var("ESCROW_NPUB")?;
+    env_logger::builder()
+        .filter_module("client", log::LevelFilter::Debug) // logging level of the client
+        .filter_level(log::LevelFilter::Info) // logging level of all other crates
+        .init();
+
     let mint_url = env::var("MINT_URL")?;
-    let ecash_wallet = EcashWallet::new(mint_url.as_str()).await?;
-    let mut seller_ecash_pubkey: String = String::new();
-    let mut buyer_ecash_pubkey: String = String::new();
-    let nostr_client: NostrClient;
+    let escrow_wallet = ClientEcashWallet::new(&mint_url).await?;
 
-    let mode = match get_user_input("Select mode: (1) buyer, (2) seller: ")
-        .await?
-        .as_str()
-    {
-        "1" => {
-            nostr_client = NostrClient::new(&env::var("BUYER_NSEC")?).await?;
-            buyer_npub = nostr_client.get_npub()?;
-            //println!("Buyer npub: {}", &buyer_npub);
-            seller_ecash_pubkey = get_user_input("Enter seller's ecash pubkey: ").await?;
-            buyer_ecash_pubkey = ecash_wallet.trade_pubkey.clone();
-            String::from("buyer")
-        }
-        "2" => {
-            nostr_client = NostrClient::new(&env::var("SELLER_NSEC")?).await?;
-            seller_npub = nostr_client.get_npub()?;
-            //println!("Seller npub: {}", &seller_npub);
-            seller_ecash_pubkey = ecash_wallet.trade_pubkey.clone();
-            buyer_ecash_pubkey = get_user_input("Enter buyer's ecash pubkey: ").await?;
-            String::from("seller")
-        }
-        _ => {
-            panic!("Wrong trading mode selected. Select either (1) buyer or (2) seller");
-        }
-    };
+    //todo: Ensure to have enough funds in the wallet. The buyer must probably transfer some ecash to the escrow wallet.
 
-    let contract = TradeContract {
-        trade_description: "Purchase of one Watermelon for 5000 satoshi. 3 days delivery to ..."
-            .to_string(),
-        trade_mint_url: mint_url,
-        trade_amount_sat: 5000,
-        npub_seller: seller_npub,
-        npub_buyer: buyer_npub,
-        time_limit: 3 * 24 * 60 * 60,
-        seller_ecash_public_key: seller_ecash_pubkey,
-        buyer_ecash_public_key: buyer_ecash_pubkey,
-    };
+    let cli_input = ClientCliInput::parse().await?;
+    //todo: create TradeContrac and ExcrowClientMetadata (models) from CLI input and pass them to the EscrowClient. The escrow client shouldn't depend on the CLI module.
+    let mut escrow_client = EscrowClient::from_cli_input(cli_input, escrow_wallet).await?;
 
-    let escrow_user =
-        EscrowUser::new(contract, ecash_wallet, nostr_client, coordinator_npub).await?;
+    escrow_client.register_trade().await?;
+    debug!("Common trade registration completed");
 
-    match mode.as_str() {
-        "buyer" => Trader::Buyer(escrow_user).init_trade().await,
-        "seller" => Trader::Seller(escrow_user).init_trade().await,
-        _ => return Err(anyhow!("Invalid mode")),
-    }
+    escrow_client.exchange_trade_token().await?;
+
+    escrow_client.do_your_trade_duties().await
 }
